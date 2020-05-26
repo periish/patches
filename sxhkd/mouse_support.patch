@@ -1,0 +1,222 @@
+diff --git a/doc/sxhkd.1 b/doc/sxhkd.1
+index 8beacfc..12d495b 100644
+--- a/doc/sxhkd.1
++++ b/doc/sxhkd.1
+@@ -69,11 +69,25 @@ Read the main configuration from the given file\&.
+ Redirect the commands output to the given file\&.
+ .RE
+ .PP
++\fB\-o\fR \fIMOTION_SOCKET\fR
++.RS 4
++Write motion messages to the given SOCKET\&.
++.RE
++.PP
++\fB\-g\fR \fIMOTION_MSG_TPL\fR
++.RS 4
++Motion messages template\&.
++.RE
++.PP
+ \fB\-s\fR \fISTATUS_FIFO\fR
+ .RS 4
+ Output status information to the given FIFO\&.
+ .RE
+ .PP
++\fB\-f\fR \fIFREQUENCY\fR
++.RS 4
++Set the maximum frequency for motion events\&.
++.RE
+ \fB\-a\fR \fIABORT_KEYSYM\fR
+ .RS 4
+ Name of the keysym used for aborting chord chains\&.
+@@ -166,7 +180,7 @@ If \fB@\fR is added at the beginning of the keysym, the command will be run on k
+ .sp
+ If \fB~\fR is added at the beginning of the keysym, the captured event will be replayed for the other clients\&.
+ .sp
+-Pointer hotkeys can be defined by using one of the following special keysym names: \fIbutton1\fR, \fIbutton2\fR, \fIbutton3\fR, \&..., \fIbutton24\fR\&.
++Mouse hotkeys can be defined by using one of the following special keysym names: \fIbutton1\fR, \fIbutton2\fR, \fIbutton3\fR, \&..., \fIbutton24\fR\&.
+ .sp
+ The hotkey and the command may contain sequences of the form \fI{STRING_1,\&...,STRING_N}\fR\&.
+ .sp
+diff --git a/src/sxhkd.c b/src/sxhkd.c
+index bddd64e..defe1a2 100644
+--- a/src/sxhkd.c
++++ b/src/sxhkd.c
+@@ -30,6 +30,7 @@
+ #include <sys/select.h>
+ #include <sys/types.h>
+ #include <sys/time.h>
++#include <sys/socket.h>
+ #include <fcntl.h>
+ #include <signal.h>
+ #include <stdbool.h>
+@@ -40,15 +41,22 @@ int main(int argc, char *argv[])
+ {
+ 	int opt;
+ 	char *fifo_path = NULL;
++    char *socket_path = NULL;
+ 	status_fifo = NULL;
+ 	config_path = NULL;
+ 	mapping_count = 0;
+ 	timeout = TIMEOUT;
+ 	grabbed = false;
++	sock_address.sun_family = AF_UNIX;
++	sock_address.sun_path[0] = 0;
++	snprintf(motion_msg_tpl, sizeof(motion_msg_tpl), "%s", MOTION_MSG_TPL);
++	unsigned int max_freq = 0;
++	motion_interval = 0;
++	last_motion_time = 0;
+ 	redir_fd = -1;
+ 	abort_keysym = ESCAPE_KEYSYM;
+ 
+-	while ((opt = getopt(argc, argv, "hvm:t:c:r:s:a:")) != -1) {
++	while ((opt = getopt(argc, argv, "vhm:t:c:r:s:a:f:o:g:")) != -1) {
+ 		switch (opt) {
+ 			case 'v':
+ 				printf("%s\n", VERSION);
+@@ -76,6 +84,16 @@ int main(int argc, char *argv[])
+ 			case 's':
+ 				fifo_path = optarg;
+ 				break;
++			case 'o':
++				socket_path = optarg;
++				break;
++			case 'g':
++				snprintf(motion_msg_tpl, sizeof(motion_msg_tpl), "%s", optarg);
++				break;
++			case 'f':
++				if (sscanf(optarg, "%u", &max_freq) != 1)
++					warn("Can't parse maximum pointer frequency.\n");
++				break;
+ 			case 'a':
+ 				if (!parse_keysym(optarg, &abort_keysym)) {
+ 					warn("Invalid keysym name: %s.\n", optarg);
+@@ -96,6 +114,22 @@ int main(int argc, char *argv[])
+ 	} else {
+ 		snprintf(config_file, sizeof(config_file), "%s", config_path);
+ 	}
++    if (socket_path == NULL) {
++		socket_path = getenv(SOCKET_ENV);
++	}
++
++	if (socket_path == NULL) {
++		char *host = NULL;
++		int dn = 0, sn = 0;
++		if (xcb_parse_display(NULL, &host, &dn, &sn) != 0) {
++			snprintf(sock_address.sun_path, sizeof(sock_address.sun_path), SOCKET_PATH_TPL, host, dn, sn);
++		} else {
++			warn("Failed to set motion socket address.");
++		}
++		free(host);
++	} else {
++		snprintf(sock_address.sun_path, sizeof(sock_address.sun_path), "%s", socket_path);
++	}
+ 
+ 	if (fifo_path != NULL) {
+ 		int fifo_fd = open(fifo_path, O_RDWR | O_NONBLOCK);
+@@ -106,6 +140,9 @@ int main(int argc, char *argv[])
+ 		}
+ 	}
+ 
++    if (max_freq != 0)
++		motion_interval = 1000.0 / max_freq;
++
+ 	signal(SIGINT, hold);
+ 	signal(SIGHUP, hold);
+ 	signal(SIGTERM, hold);
+@@ -146,6 +183,9 @@ int main(int argc, char *argv[])
+ 					case XCB_BUTTON_RELEASE:
+ 						key_button_event(evt, event_type);
+ 						break;
++					case XCB_MOTION_NOTIFY:
++						motion_notify(evt);
++						break;
+ 					case XCB_MAPPING_NOTIFY:
+ 						mapping_notify(evt);
+ 						break;
+@@ -233,6 +273,42 @@ void key_button_event(xcb_generic_event_t *evt, uint8_t event_type)
+ 	xcb_flush(dpy);
+ }
+ 
++void motion_notify(xcb_generic_event_t *evt)
++{
++	xcb_motion_notify_event_t *e = (xcb_motion_notify_event_t *) evt;
++	PRINTF("motion notify %X %X %u %i %i\n", e->child, e->detail, e->state, e->root_x, e->root_y);
++	if (motion_interval > 0 && (e->time - last_motion_time) < motion_interval)
++		return;
++	last_motion_time = e->time;
++	char msg[MAXLEN];
++	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++	if (fd == -1) {
++		return;
++	}
++	if (connect(fd, (struct sockaddr *) &sock_address, sizeof(sock_address)) == -1) {
++		close(fd);
++		return;
++	}
++	int len = sizeof(msg), i = 0;
++	for (int j = 0, c = motion_msg_tpl[j]; c && i < len; j++, c = motion_msg_tpl[j]) {
++		if (c == ' ') {
++			msg[i++] = 0;
++		} else if (c == 'X') {
++			i += snprintf(msg+i, len-i, "%i", e->root_x);
++		} else if (c == 'Y') {
++			i += snprintf(msg+i, len-i, "%i", e->root_y);
++		} else {
++			msg[i++] = c;
++		}
++	}
++	if (i >= len) {
++		i--;
++	}
++	msg[i] = 0;
++	send(fd, msg, i+1, 0);
++	close(fd);
++}
++
+ void mapping_notify(xcb_generic_event_t *evt)
+ {
+ 	if (!mapping_count)
+diff --git a/src/sxhkd.h b/src/sxhkd.h
+index a8e0228..59c08c6 100644
+--- a/src/sxhkd.h
++++ b/src/sxhkd.h
+@@ -28,6 +28,7 @@
+ #include <xcb/xcb_keysyms.h>
+ #include <stdio.h>
+ #include <stdbool.h>
++#include <sys/un.h>
+ #include "types.h"
+ #include "helpers.h"
+ 
+@@ -35,6 +36,9 @@
+ #define SXHKD_SHELL_ENV     "SXHKD_SHELL"
+ #define SHELL_ENV           "SHELL"
+ #define CONFIG_PATH         "sxhkd/sxhkdrc"
++#define SOCKET_ENV          "BSPWM_SOCKET"
++#define SOCKET_PATH_TPL     "/tmp/bspwm%s_%i_%i-socket"
++#define MOTION_MSG_TPL      "pointer -t X Y"
+ #define HOTKEY_PREFIX       'H'
+ #define COMMAND_PREFIX      'C'
+ #define BEGIN_CHAIN_PREFIX  'B'
+@@ -53,9 +57,13 @@ char **extra_confs;
+ int num_extra_confs;
+ int redir_fd;
+ FILE *status_fifo;
++struct sockaddr_un sock_address;
++char motion_msg_tpl[MAXLEN];
+ char progress[3 * MAXLEN];
+ int mapping_count;
+ int timeout;
++double motion_interval;
++xcb_timestamp_t last_motion_time;
+ 
+ hotkey_t *hotkeys_head, *hotkeys_tail;
+ bool running, grabbed, toggle_grab, reload, bell, chained, locked;
+@@ -67,6 +75,7 @@ uint16_t caps_lock;
+ uint16_t scroll_lock;
+ 
+ void key_button_event(xcb_generic_event_t *evt, uint8_t event_type);
++void motion_notify(xcb_generic_event_t *evt);
+ void mapping_notify(xcb_generic_event_t *evt);
+ void setup(void);
+ void cleanup(void);
