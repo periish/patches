@@ -1,3 +1,16 @@
+diff --git a/Makefile b/Makefile
+index 01f088b..3746415 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@ OUT      = sxhkd
+ VERCMD  ?= git describe --tags 2> /dev/null
+ VERSION := $(shell $(VERCMD) || cat VERSION)
+ 
+-CPPFLAGS += -D_POSIX_C_SOURCE=200112L -DVERSION=\"$(VERSION)\"
++CPPFLAGS += -D_POSIX_C_SOURCE=200112L -DVERSION=\"$(VERSION)\" -fcommon
+ CFLAGS   += -std=c99 -pedantic -Wall -Wextra
+ LDFLAGS  ?=
+ LDLIBS    = $(LDFLAGS) -lxcb -lxcb-keysyms
 diff --git a/doc/sxhkd.1 b/doc/sxhkd.1
 index 8beacfc..12d495b 100644
 --- a/doc/sxhkd.1

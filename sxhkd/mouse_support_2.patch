@@ -1,0 +1,146 @@
+diff --git a/Makefile b/Makefile
+index 01f088b..479da92 100644
+--- a/Makefile
++++ b/Makefile
+@@ -3,7 +3,7 @@ VERCMD  ?= git describe --tags 2> /dev/null
+ VERSION := $(shell $(VERCMD) || cat VERSION)
+ 
+ CPPFLAGS += -D_POSIX_C_SOURCE=200112L -DVERSION=\"$(VERSION)\"
+-CFLAGS   += -std=c99 -pedantic -Wall -Wextra
++CFLAGS   += -std=c99 -pedantic -Wall -Wextra -fcommon -g
+ LDFLAGS  ?=
+ LDLIBS    = $(LDFLAGS) -lxcb -lxcb-keysyms
+ 
+diff --git a/src/grab.c b/src/grab.c
+index bf031f9..4ce5190 100644
+--- a/src/grab.c
++++ b/src/grab.c
+@@ -79,7 +79,7 @@ void grab_key_button_checked(xcb_keycode_t keycode, xcb_button_t button, uint16_
+ 	if (button == XCB_NONE)
+ 		err = xcb_request_check(dpy, xcb_grab_key_checked(dpy, true, root, modfield, keycode, XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_SYNC));
+ 	else
+-		err = xcb_request_check(dpy, xcb_grab_button_checked(dpy, true, root, XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE, XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_ASYNC, XCB_NONE, XCB_NONE, button, modfield));
++ 		err = xcb_request_check(dpy, xcb_grab_button_checked(dpy, true, root, XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_BUTTON_MOTION, XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_ASYNC, XCB_NONE, XCB_NONE, button, modfield));
+ 	unsigned int value = (button == XCB_NONE ? keycode : button);
+ 	char *type = (button == XCB_NONE ? "key" : "button");
+ 	if (err != NULL) {
+diff --git a/src/parse.c b/src/parse.c
+index d5af64b..ebbe992 100644
+--- a/src/parse.c
++++ b/src/parse.c
+@@ -2665,6 +2665,10 @@ bool parse_chain(char *string, chain_t *chain)
+ 				replay_event = true;
+ 				offset++;
+ 			}
++			if (name[offset] == MOTION_PREFIX) {
++				event_type = XCB_MOTION_NOTIFY;
++				offset++;
++			}
+ 			if (name[offset] == RELEASE_PREFIX) {
+ 				event_type = XCB_KEY_RELEASE;
+ 				offset++;
+diff --git a/src/parse.h b/src/parse.h
+index 8af9026..d18c24a 100644
+--- a/src/parse.h
++++ b/src/parse.h
+@@ -28,6 +28,7 @@
+ #include "sxhkd.h"
+ 
+ #define RELEASE_PREFIX       '@'
++#define MOTION_PREFIX        '!'
+ #define REPLAY_PREFIX        '~'
+ #define START_COMMENT        '#'
+ #define MAGIC_INHIBIT        '\\'
+diff --git a/src/sxhkd.c b/src/sxhkd.c
+index bddd64e..f111d52 100644
+--- a/src/sxhkd.c
++++ b/src/sxhkd.c
+@@ -44,11 +44,14 @@ int main(int argc, char *argv[])
+ 	config_path = NULL;
+ 	mapping_count = 0;
+ 	timeout = TIMEOUT;
++    unsigned int max_freq = 0;
++    motion_interval = 0;
++	last_motion_time = 0;
+ 	grabbed = false;
+ 	redir_fd = -1;
+ 	abort_keysym = ESCAPE_KEYSYM;
+ 
+-	while ((opt = getopt(argc, argv, "hvm:t:c:r:s:a:")) != -1) {
++	while ((opt = getopt(argc, argv, "hvm:t:c:r:s:a:f")) != -1) {
+ 		switch (opt) {
+ 			case 'v':
+ 				printf("%s\n", VERSION);
+@@ -81,6 +84,10 @@ int main(int argc, char *argv[])
+ 					warn("Invalid keysym name: %s.\n", optarg);
+ 				}
+ 				break;
++			case 'f':
++				if (sscanf(optarg, "%u", &max_freq) != 1)
++					warn("Can't parse maximum pointer frequency.\n");
++				break;
+ 		}
+ 	}
+ 
+@@ -146,6 +153,9 @@ int main(int argc, char *argv[])
+ 					case XCB_BUTTON_RELEASE:
+ 						key_button_event(evt, event_type);
+ 						break;
++			        case XCB_MOTION_NOTIFY:
++						motion_notify(evt, event_type);
++						break;
+ 					case XCB_MAPPING_NOTIFY:
+ 						mapping_notify(evt);
+ 						break;
+@@ -233,6 +243,30 @@ void key_button_event(xcb_generic_event_t *evt, uint8_t event_type)
+ 	xcb_flush(dpy);
+ }
+ 
++
++void motion_notify(xcb_generic_event_t *evt, uint8_t event_type)
++{
++	xcb_motion_notify_event_t *e = (xcb_motion_notify_event_t *) evt;
++	/* PRINTF("motion notify %X %X %u\n", e->child, e->detail, e->state); */
++	if (motion_interval > 0 && (e->time - last_motion_time) < motion_interval)
++		return;
++	last_motion_time = e->time;
++	uint16_t lockfield = num_lock | caps_lock | scroll_lock;
++	uint16_t buttonfield = e->state >> 8;
++	uint16_t modfield = e->state & ~lockfield & MOD_STATE_FIELD;
++	xcb_button_t button = 1;
++	while (~buttonfield & 1 && button < 5) {
++		buttonfield = buttonfield >> 1;
++		button++;
++	}
++	hotkey_t *hk = find_hotkey(XCB_NO_SYMBOL, button, modfield, event_type, NULL);
++	if (hk != NULL) {
++        char command[2 * MAXLEN];
++        snprintf(command, sizeof(command), hk->command, e->root_x, e->root_y);
++		run(command, hk->sync);
++	}
++}
++
+ void mapping_notify(xcb_generic_event_t *evt)
+ {
+ 	if (!mapping_count)
+diff --git a/src/sxhkd.h b/src/sxhkd.h
+index a8e0228..07947f6 100644
+--- a/src/sxhkd.h
++++ b/src/sxhkd.h
+@@ -56,6 +56,8 @@ FILE *status_fifo;
+ char progress[3 * MAXLEN];
+ int mapping_count;
+ int timeout;
++double motion_interval;
++xcb_timestamp_t last_motion_time;
+ 
+ hotkey_t *hotkeys_head, *hotkeys_tail;
+ bool running, grabbed, toggle_grab, reload, bell, chained, locked;
+@@ -67,6 +69,7 @@ uint16_t caps_lock;
+ uint16_t scroll_lock;
+ 
+ void key_button_event(xcb_generic_event_t *evt, uint8_t event_type);
++void motion_notify(xcb_generic_event_t *evt, uint8_t event_type);
+ void mapping_notify(xcb_generic_event_t *evt);
+ void setup(void);
+ void cleanup(void);
